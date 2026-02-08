@@ -20,7 +20,7 @@ print(f"Using device: {device}")
 
 if device.type == 'cuda':
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Total memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GB")
+    print(f"Total memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
 
 def measure_kv_cache_size(seq_len, n_heads, d_h, n_kv_heads=None, dtype=torch.float16):
