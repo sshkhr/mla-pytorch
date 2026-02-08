@@ -40,8 +40,8 @@ from mla import MultiHeadAttention, MultiHeadLatentAttention
 mha = MultiHeadAttention(d_model=512, n_heads=8)
 output = mha(x)  # x: (batch, seq_len, 512)
 
-# MLA with latent compression
-mla = MultiHeadLatentAttention(d_model=512, n_heads=8, d_c=64)
+# MLA with latent compression (KV + query compression)
+mla = MultiHeadLatentAttention(d_model=512, n_heads=8, d_c=64, d_cq=96)
 output = mla(x, use_cache=True)  # caches compressed latent
 ```
 
