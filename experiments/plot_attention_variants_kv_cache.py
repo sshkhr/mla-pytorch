@@ -101,7 +101,7 @@ if __name__ == "__main__":
 
     # Add reference lines for GPU memory
     ax.axhline(y=16*1024, color='gray', linestyle='--', alpha=0.5)
-    ax.text(seq_lengths[1]/1000, 18*1024, 'T4 16GB', fontsize=9, color='gray')
+    ax.text(seq_lengths[1]/1000, 18*1024, '5060 Ti 16GB', fontsize=9, color='gray')
     ax.axhline(y=80*1024, color='darkgray', linestyle='--', alpha=0.5)
     ax.text(seq_lengths[1]/1000, 90*1024, 'H100 80GB', fontsize=9, color='darkgray')
 

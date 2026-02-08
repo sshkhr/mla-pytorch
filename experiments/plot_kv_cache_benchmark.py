@@ -125,8 +125,9 @@ if __name__ == "__main__":
 
     # ============== Run Benchmarks ==============
 
-    model_with_cache = MultiHeadAttention(d_model, n_heads).to(device)
-    model_no_cache = MultiHeadAttention(d_model, n_heads).to(device)
+    max_seq_len = max(seq_lengths)
+    model_with_cache = MultiHeadAttention(d_model, n_heads, max_seq_len=max_seq_len).to(device)
+    model_no_cache = MultiHeadAttention(d_model, n_heads, max_seq_len=max_seq_len).to(device)
 
     times_with_cache = []
     times_with_cache_std = []
