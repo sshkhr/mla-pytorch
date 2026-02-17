@@ -1,9 +1,13 @@
 """
 Plot attention compute scaling: O(N^2) FLOPs for attention.
 
-Benchmarks attention matmuls (QK^T → softmax → attn@V) at GPT-2 scale on
-the available GPU.  Estimates DeepSeek-V2 times on A100 theoretically,
-calibrated from the measured GPU utilisation fraction.
+Benchmarks attention compute at GPT-2 scale on the available GPU using
+F.scaled_dot_product_attention (FlashAttention backend), which performs
+the same O(N^2) FLOPs without materialising the full N×N scores matrix.
+This lets us measure up to 64K+ on consumer GPUs.
+
+Estimates DeepSeek-V2 times on A100 at a fixed 70% utilisation (large
+matmuls at DS-V2 scale saturate tensor cores well).
 
 Model configs (matching the blog):
   GPT-2:        n_heads=12,  d_h=64   (d_model=768)
@@ -32,13 +36,19 @@ MODELS = {
 
 SEQ_LENGTHS = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
 
-# Peak fp16 tensor-core TFLOP/s for common GPUs (extend as needed)
+# A100 SXM4: 312 TFLOP/s fp16 tensor-core peak
+# At DS-V2 scale (128 heads, d_h=128) the matmuls are large enough to
+# saturate tensor cores.  70% is conservative for compute-bound GEMMs.
+A100_PEAK_TFLOPS = 312.0
+A100_UTIL = 0.70
+A100_EFFECTIVE = A100_PEAK_TFLOPS * A100_UTIL  # 218.4 TFLOP/s
+
+# Peak fp16 tensor-core TFLOP/s for common GPUs
 GPU_PEAKS = {
     "5060 Ti": 190, "5060ti": 190,
     "4090": 330, "3090": 142, "3080": 119,
     "A6000": 155, "A100": 312, "H100": 990,
 }
-A100_PEAK_TFLOPS = 312.0
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -53,13 +63,6 @@ def attention_flops(seq_len: int, n_heads: int, d_h: int) -> int:
     Total = 4 · n_heads · N² · d_h
     """
     return 4 * n_heads * seq_len * seq_len * d_h
-
-
-def attn_memory_bytes(seq_len: int, n_heads: int, d_h: int) -> int:
-    """Peak memory for Q, K, V, output + scores matrix (fp16, batch=1)."""
-    scores = n_heads * seq_len * seq_len * 2
-    qkv_out = 4 * n_heads * seq_len * d_h * 2
-    return scores + qkv_out
 
 
 def format_flops(flops: float) -> str:
@@ -81,7 +84,6 @@ def format_time(seconds: float) -> str:
 
 
 def detect_gpu_peak() -> float:
-    """Try to match the detected GPU to a known fp16 peak TFLOP/s."""
     name = torch.cuda.get_device_name(0).lower()
     for key, val in GPU_PEAKS.items():
         if key.lower() in name:
@@ -91,10 +93,8 @@ def detect_gpu_peak() -> float:
 
 
 def short_gpu_name() -> str:
-    """Strip 'NVIDIA' prefix and 'Laptop GPU' suffix for compact labels."""
     name = torch.cuda.get_device_name(0)
-    name = name.replace("NVIDIA ", "").replace(" Laptop GPU", "")
-    return name
+    return name.replace("NVIDIA ", "").replace(" Laptop GPU", "")
 
 
 # ── Benchmark ────────────────────────────────────────────────────────────────
@@ -104,11 +104,18 @@ def benchmark_attention(seq_len: int, n_heads: int, d_h: int,
                         device="cuda", dtype=torch.float16,
                         warmup=5, repeats=20):
     """
-    Time QK^T → softmax → attn@V with random tensors.  No model needed.
+    Benchmark attention compute using F.scaled_dot_product_attention.
+
+    This uses the FlashAttention / memory-efficient backend under the hood,
+    so it performs the same O(N^2) FLOPs without materialising the full N×N
+    scores matrix.  This allows benchmarking at much longer sequences.
+
     Returns (median_seconds, achieved_tflops) or (None, None) on OOM.
     """
     flops = attention_flops(seq_len, n_heads, d_h)
+
     try:
+        # Shape: (batch, n_heads, seq_len, d_h)
         Q = torch.randn(1, n_heads, seq_len, d_h, device=device, dtype=dtype)
         K = torch.randn(1, n_heads, seq_len, d_h, device=device, dtype=dtype)
         V = torch.randn(1, n_heads, seq_len, d_h, device=device, dtype=dtype)
@@ -117,19 +124,19 @@ def benchmark_attention(seq_len: int, n_heads: int, d_h: int,
         return None, None
 
     def run():
-        s = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_h)
-        a = F.softmax(s, dim=-1)
-        return torch.matmul(a, V)
+        return F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
+    # Warmup
     for _ in range(warmup):
         try:
             run()
-        except torch.cuda.OutOfMemoryError:
+        except (torch.cuda.OutOfMemoryError, RuntimeError):
             del Q, K, V
             torch.cuda.empty_cache()
             return None, None
 
     torch.cuda.synchronize()
+
     times = []
     for _ in range(repeats):
         torch.cuda.synchronize()
@@ -151,15 +158,16 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         gpu_label = short_gpu_name()
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         local_peak = detect_gpu_peak()
-        print(f"GPU: {gpu_label} ({gpu_mem:.1f} GB, {local_peak:.0f} TFLOP/s peak)\n")
+        print(f"GPU: {gpu_label} ({gpu_mem:.1f} GB, {local_peak:.0f} TFLOP/s peak)")
+        print(f"Using F.scaled_dot_product_attention (FlashAttention backend)\n")
     else:
         gpu_label, gpu_mem, local_peak = "CPU", 0, 190
         print("No CUDA GPU — skipping benchmarks.\n")
 
     cfg_gpt2 = MODELS["GPT-2"]
-    cfg_ds   = MODELS["DeepSeek-V2"]
+    cfg_ds = MODELS["DeepSeek-V2"]
 
     # ── 1.  Theoretical FLOPs ────────────────────────────────────────────────
     gpt2_flops = [attention_flops(n, **cfg_gpt2) for n in SEQ_LENGTHS]
@@ -181,33 +189,25 @@ if __name__ == "__main__":
         gpt2_times = [None] * len(SEQ_LENGTHS)
         gpt2_achieved = [None] * len(SEQ_LENGTHS)
 
-    # ── 3.  Calibrate A100 estimate ──────────────────────────────────────────
+    # ── 3.  DS-V2 theoretical times on A100 ──────────────────────────────────
+    print(f"\nDeepSeek-V2 A100 estimate: {A100_PEAK_TFLOPS:.0f} peak × "
+          f"{A100_UTIL*100:.0f}% util = {A100_EFFECTIVE:.0f} effective TFLOP/s")
+
+    ds_times_est = [f / (A100_EFFECTIVE * 1e12) for f in ds_flops]
+
+    # GPT-2 OOM extrapolation (if any)
     valid = [t for t in gpt2_achieved if t is not None]
-    if valid:
-        measured_util = max(valid) / local_peak
-        a100_util = min(max(measured_util, 0.50), 0.85)
-    else:
-        a100_util = 0.65
-    a100_eff = A100_PEAK_TFLOPS * a100_util
-    print(f"\nA100 estimate: {A100_PEAK_TFLOPS:.0f} peak × "
-          f"{a100_util*100:.0f}% util = {a100_eff:.0f} effective TFLOP/s")
-
-    # Peak measured TFLOP/s for GPT-2 OOM extrapolation
-    gpt2_peak = max(valid) if valid else local_peak * 0.65
-
-    # ── 4.  Assemble table arrays ────────────────────────────────────────────
+    gpt2_peak = max(valid) if valid else local_peak * 0.05
     gpt2_oom = [t is None for t in gpt2_times]
-    ds_oom   = [attn_memory_bytes(n, **cfg_ds) > 80e9 for n in SEQ_LENGTHS]
 
     gpt2_time_col = [
         gpt2_times[i] if not gpt2_oom[i]
         else gpt2_flops[i] / (gpt2_peak * 1e12)
         for i in range(len(SEQ_LENGTHS))
     ]
-    ds_time_col = [f / (a100_eff * 1e12) for f in ds_flops]
 
-    # ── 5.  Print table ──────────────────────────────────────────────────────
-    W = [10, 16, 18, 18, 20]                  # column widths
+    # ── 4.  Print table ──────────────────────────────────────────────────────
+    W = [10, 16, 18, 18, 20]
     div = "=" * (sum(W) + 8)
 
     print(f"\n{div}")
@@ -226,21 +226,20 @@ if __name__ == "__main__":
         if gpt2_oom[i]:
             tg = f"({tg})*"
 
-        td = format_time(ds_time_col[i])
-        if ds_oom[i]:
-            td = f"({td})*"
+        # All DS-V2 times are theoretical estimates
+        td = format_time(ds_times_est[i])
 
         print(f"{n:>{W[0]}}  {fg:>{W[1]}}  {tg:>{W[2]}}  "
               f"{fd:>{W[3]}}  {td:>{W[4]}}")
 
     print(div)
-    print("* Theoretical — attention matrix exceeds GPU memory at this length.")
-    print(f"  GPT-2 OOM rows: extrapolated at {gpt2_peak:.0f} TFLOP/s "
-          f"(measured peak on {gpu_label}).")
-    print(f"  DeepSeek-V2:    estimated at {a100_eff:.0f} TFLOP/s "
-          f"(A100 {A100_PEAK_TFLOPS:.0f} peak × {a100_util*100:.0f}% util).\n")
+    if any(gpt2_oom):
+        print(f"* GPT-2 OOM rows extrapolated at {gpt2_peak:.0f} TFLOP/s "
+              f"(measured peak on {gpu_label}).")
+    print(f"  DeepSeek-V2 estimated at {A100_EFFECTIVE:.0f} TFLOP/s "
+          f"(A100 {A100_PEAK_TFLOPS:.0f} peak × {A100_UTIL*100:.0f}% util).\n")
 
-    # ── 6.  Plot ─────────────────────────────────────────────────────────────
+    # ── 5.  Plot ─────────────────────────────────────────────────────────────
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     S = np.array(SEQ_LENGTHS, dtype=float)
 
@@ -263,31 +262,24 @@ if __name__ == "__main__":
         ticker.FuncFormatter(lambda x, _: format_flops(x)))
 
     # ── Right panel: wall time ───────────────────────────────────────────────
-    gpt2_ms = [t * 1e3 for t in gpt2_time_col]
-    ds_ms   = [t * 1e3 for t in ds_time_col]
+    gpt2_ms = np.array([t * 1e3 for t in gpt2_time_col])
+    ds_ms   = np.array([t * 1e3 for t in ds_times_est])
 
     # GPT-2: measured (solid) + OOM extension (dashed)
-    m = [not o for o in gpt2_oom]
-    if any(m):
-        ax2.loglog(S[m], np.array(gpt2_ms)[m], "b-o", lw=2, ms=6,
+    m = np.array([not o for o in gpt2_oom])
+    if m.any():
+        ax2.loglog(S[m], gpt2_ms[m], "b-o", lw=2, ms=6,
                    label=f"GPT-2 measured ({gpu_label})")
-    if any(gpt2_oom) and any(m):
+    if any(gpt2_oom) and m.any():
         last_m = int(np.where(m)[0][-1])
         ext_idx = [last_m] + [j for j, o in enumerate(gpt2_oom) if o]
-        ax2.loglog(S[ext_idx], np.array(gpt2_ms)[ext_idx],
+        ax2.loglog(S[ext_idx], gpt2_ms[ext_idx],
                    "b--^", lw=1.5, ms=5, alpha=0.6,
                    label="GPT-2 theoretical (OOM)")
 
-    # DS-V2: fits (solid) + OOM (dashed)
-    f_mask = [not o for o in ds_oom]
-    ax2.loglog(S[f_mask], np.array(ds_ms)[f_mask], "r-s", lw=2, ms=5,
-               label="DeepSeek-V2 est. (A100)")
-    if any(ds_oom):
-        last_f = int(np.where(f_mask)[0][-1])
-        ext_idx = [last_f] + [j for j, o in enumerate(ds_oom) if o]
-        ax2.loglog(S[ext_idx], np.array(ds_ms)[ext_idx],
-                   "r--^", lw=1.5, ms=5, alpha=0.6,
-                   label="DeepSeek-V2 est. (A100, OOM)")
+    # DS-V2: all theoretical
+    ax2.loglog(S, ds_ms, "r-s", lw=2, ms=5,
+               label=f"DeepSeek-V2 estimated (A100, {A100_UTIL*100:.0f}% util)")
 
     ax2.set_xlabel("Sequence Length", fontsize=12)
     ax2.set_ylabel("Wall Time (ms)", fontsize=12)
