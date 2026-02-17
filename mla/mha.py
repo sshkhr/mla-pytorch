@@ -29,6 +29,7 @@ class MultiHeadAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
         # Pre-allocated KV cache buffers
+        # Note: batch dim=1 for simplicity; for batched inference, parameterize with max_batch_size
         self.register_buffer('k_cache', torch.zeros(1, n_heads, max_seq_len, self.d_h))
         self.register_buffer('v_cache', torch.zeros(1, n_heads, max_seq_len, self.d_h))
         self.cache_position = 0
@@ -50,6 +51,16 @@ class MultiHeadAttention(nn.Module):
             V = self.v_cache[:B, :, :end, :]
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_h)
+
+        # Apply causal mask during prefill (seq_len > 1)
+        if seq_len > 1:
+            cache_len = K.size(2)
+            causal_mask = torch.triu(
+                torch.ones(seq_len, cache_len, device=x.device, dtype=torch.bool),
+                diagonal=cache_len - seq_len + 1
+            )
+            scores = scores.masked_fill(causal_mask, float('-inf'))
+
         attn = F.softmax(scores, dim=-1)
         output = torch.matmul(attn, V)
 

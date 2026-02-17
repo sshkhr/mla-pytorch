@@ -30,6 +30,7 @@ class GroupedQueryAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model, bias=False)
 
         # Pre-allocated KV cache buffers (only n_kv_heads, not n_heads)
+        # Note: batch dim=1 for simplicity; for batched inference, parameterize with max_batch_size
         self.register_buffer('k_cache', torch.zeros(1, n_kv_heads, max_seq_len, self.d_h))
         self.register_buffer('v_cache', torch.zeros(1, n_kv_heads, max_seq_len, self.d_h))
         self.cache_position = 0
@@ -50,10 +51,20 @@ class GroupedQueryAttention(nn.Module):
             K = self.k_cache[:B, :, :end, :]
             V = self.v_cache[:B, :, :end, :]
 
-        K = K.repeat_interleave(self.n_groups, dim=1)
-        V = V.repeat_interleave(self.n_groups, dim=1)
+        K = K.unsqueeze(2).expand(-1, -1, self.n_groups, -1, -1).reshape(B, self.n_heads, -1, self.d_h)
+        V = V.unsqueeze(2).expand(-1, -1, self.n_groups, -1, -1).reshape(B, self.n_heads, -1, self.d_h)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_h)
+
+        # Apply causal mask during prefill (seq_len > 1)
+        if seq_len > 1:
+            cache_len = K.size(2)
+            causal_mask = torch.triu(
+                torch.ones(seq_len, cache_len, device=x.device, dtype=torch.bool),
+                diagonal=cache_len - seq_len + 1
+            )
+            scores = scores.masked_fill(causal_mask, float('-inf'))
+
         attn = F.softmax(scores, dim=-1)
         output = torch.matmul(attn, V)
 

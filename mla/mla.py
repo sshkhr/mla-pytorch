@@ -50,6 +50,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.W_o = nn.Linear(n_heads * self.d_h, d_model, bias=False)
 
         # Pre-allocated latent cache
+        # Note: batch dim=1 for simplicity; for batched inference, parameterize with max_batch_size
         self.register_buffer('latent_cache', torch.zeros(1, max_seq_len, d_c))
         self.cache_position = 0
 
@@ -75,6 +76,16 @@ class MultiHeadLatentAttention(nn.Module):
         V = self.W_uv(L_kv).view(B, -1, self.n_heads, self.d_h).transpose(1, 2)
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_h)
+
+        # Apply causal mask during prefill (seq_len > 1)
+        if N > 1:
+            cache_len = K.size(2)
+            causal_mask = torch.triu(
+                torch.ones(N, cache_len, device=x.device, dtype=torch.bool),
+                diagonal=cache_len - N + 1
+            )
+            scores = scores.masked_fill(causal_mask, float('-inf'))
+
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, V)
 
@@ -133,6 +144,7 @@ class MultiHeadLatentAttentionAbsorbed(nn.Module):
         self.W_o_absorbed = nn.Linear(n_heads * d_c, d_model, bias=False)
 
         # Pre-allocated latent cache
+        # Note: batch dim=1 for simplicity; for batched inference, parameterize with max_batch_size
         self.register_buffer('latent_cache', torch.zeros(1, max_seq_len, d_c))
         self.cache_position = 0
 
@@ -159,7 +171,19 @@ class MultiHeadLatentAttentionAbsorbed(nn.Module):
         L_kv_expanded = L_kv.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
 
         # Attention directly in latent space
-        scores = torch.matmul(Q, L_kv_expanded.transpose(-2, -1)) / math.sqrt(self.d_c)
+        # Scale by sqrt(d_h), not sqrt(d_c): absorption doesn't change the dot product value,
+        # only the order of operations, so scaling tracks the original head dimension.
+        scores = torch.matmul(Q, L_kv_expanded.transpose(-2, -1)) / math.sqrt(self.d_h)
+
+        # Apply causal mask during prefill (seq_len > 1)
+        if N > 1:
+            cache_len = L_kv_expanded.size(2)
+            causal_mask = torch.triu(
+                torch.ones(N, cache_len, device=x.device, dtype=torch.bool),
+                diagonal=cache_len - N + 1
+            )
+            scores = scores.masked_fill(causal_mask, float('-inf'))
+
         attn = F.softmax(scores, dim=-1)
 
         # Output is attention-weighted latents (not full V!)
