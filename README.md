@@ -22,6 +22,7 @@ Scripts that reproduce the figures from the blog post:
 | Script | Figure | Description |
 |--------|--------|-------------|
 | `experiments/plot_attention_memory_scaling.py` | `attention_memory_scaling.png` | O(N^2) attention matrix memory scaling |
+| `experiments/plot_attention_compute_scaling.py` | `attention_compute_scaling.png` | O(N^2) attention FLOPs and wall-clock time scaling |
 | `experiments/plot_kv_cache_benchmark.py` | `kv_cache_benchmark.png` | Decoding speedup with KV caching |
 | `experiments/plot_attention_variants_kv_cache.py` | `attention_variants_kv_cache.png` | KV cache size: MHA vs GQA vs MQA |
 
@@ -49,6 +50,7 @@ Run experiments:
 
 ```bash
 python experiments/plot_attention_memory_scaling.py
+python experiments/plot_attention_compute_scaling.py
 python experiments/plot_kv_cache_benchmark.py
 python experiments/plot_attention_variants_kv_cache.py
 ```
